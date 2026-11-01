@@ -1,0 +1,25 @@
+name: flutter_hull
+description: FlutterHull 宿主容器，支持单引擎与多引擎策略，复用 Aeris 通信与连接隔离。
+version: 0.1.0-preview.1
+environment:
+  sdk: '>=3.13.7 <4.0.0'
+  flutter: '>=3.47.8'
+dependencies:
+  cupertino_icons: 1.0.8
+  flutter:
+    sdk: flutter
+  # 与原生 Pod/Gradle 共用 tooling/packaging/baseline.json 的完整提交。
+  aeris_flutter: 0.26.0-preview.2
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: FlutterHullPlugin
+      android:
+        package: com.flutterhull.sdk
+        pluginClass: FlutterHullPlugin
+
+repository: https://github.com/zhangguozhong/flutter-hull
