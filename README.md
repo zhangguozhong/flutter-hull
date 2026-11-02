@@ -2,7 +2,7 @@
 
 FlutterHull 为 Flutter 页面提供原生宿主管理、受管路由、页面资源清理和容器生命周期。`open` 创建并销毁自己的 Engine；`attach` 接入 Flutter Runner 的现有 Engine，由 Runner 保持 Engine、View 和平台回调的所有权。
 
-公开预览配对为 FlutterHull `0.1.0-preview.1`、`aeris_flutter` `0.26.0-preview.2`、Aeris Native `0.26.0-preview.1`。真机、最低系统真机、签名正式安装以及具体商业登录、支付、定位硬件插件仍待验收。该预览不声明所有第三方插件兼容。
+公开预览配对为 FlutterHull `0.1.0-preview.2`、`aeris_flutter` `0.26.0-preview.3`、Aeris Native `0.26.0-preview.2`。当前为预览版本，请按应用的目标设备和插件组合验证集成。
 
 ## 环境与依赖
 
@@ -12,14 +12,14 @@ Dart `>=3.13.7 <4.0.0`、Flutter `>=3.47.8`；iOS 15.0+；Android minSdk 24、co
 dependencies:
   flutter:
     sdk: flutter
-  flutter_hull: 0.1.0-preview.1
+  flutter_hull: 0.1.0-preview.2
 flutter:
   uses-material-design: true
   config:
     enable-swift-package-manager: false
 ```
 
-Aeris Flutter 为精确版本的 hosted 传递依赖。运行 `flutter pub get`，应用提交 `pubspec.lock`；无需私有 Git、dependency overrides 或本地 Native 替换。
+Aeris Flutter 为精确版本的 hosted 传递依赖。运行 `flutter pub get`，应用提交 `pubspec.lock`；升级时保持 Dart 与原生依赖的配套版本。
 
 ### iOS 公共 Specs
 
@@ -39,12 +39,12 @@ Flutter 自动安装 `flutter_hull`、`aeris_flutter` 及其固定的 Aeris Nati
 
 ```kotlin
 maven {
-    url = uri("https://raw.githubusercontent.com/zhangguozhong/aeris-maven/0.26.0-preview.1")
+    url = uri("https://raw.githubusercontent.com/zhangguozhong/aeris-maven/0.26.0-preview.2")
     content { includeGroup("com.aeris.sdk") }
 }
 ```
 
-保留 `google()`、`mavenCentral()`；Native 坐标应解析为 `com.aeris.sdk:aeris:0.26.0-preview.1`。无需添加本地 `:aeris` 项目或修改全局仓库。
+保留 `google()`、`mavenCentral()`；Native 坐标应解析为 `com.aeris.sdk:aeris:0.26.0-preview.2`。无需添加本地 `:aeris` 项目或修改全局仓库。
 
 ## 流程一：标准 Flutter App，接入现有 Engine
 
@@ -72,7 +72,7 @@ import flutter_hull
   private var coordinator: FlutterHullCoordinator?
 
   func attach(to controller: FlutterViewController) throws {
-    guard coordinator == nil else { return }
+    guard coordinator == nil, controller.engine.viewController === controller else { return }
     let current = FlutterHullCoordinator(
       engine: bridge, allowedPermissions: [], allowedEventTopics: [])
     try current.attach(to: controller.engine, viewController: controller,
@@ -253,4 +253,4 @@ Dart `runtime.finish(result)` 请求结束整个容器，只有 Native 配置了
 
 配置真实 Native 绑定后运行 `flutter run`。构建检查可使用 `flutter build apk --release --target-platform android-arm64` 和 `flutter build ios --release --no-codesign`；无签名编译不能替代真机安装验收。
 
-升级时同时检查上述三项配对版本、应用锁文件和 Native 依赖解析结果。保留上一套已在自己应用验收的锁文件、平台配置及应用制品用于整体回滚；本包的首个公开预览不假定存在更早的公开 Hull 版本。已发布版本和 tag 保持不变，后续修复使用新版本。
+升级时同时检查上述三项配对版本、应用锁文件和 Native 依赖解析结果。保留上一套已在自己应用验收的锁文件、平台配置及应用制品用于整体回滚；旧预览版本需连同其配套 Aeris 依赖一起回滚。已发布版本和 tag 保持不变，后续修复使用新版本。

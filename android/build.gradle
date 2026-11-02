@@ -1,6 +1,6 @@
 plugins { id 'com.android.library' }
 group = 'com.flutterhull.sdk'
-version = '0.1.0-preview.1'
+version = '0.1.0-preview.2'
 android {
     namespace 'com.flutterhull.sdk'
     compileSdk 37
