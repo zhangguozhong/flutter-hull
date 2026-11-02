@@ -2,7 +2,7 @@
 
 FlutterHull 为 Flutter 页面提供原生宿主管理、受管路由、页面资源清理和容器生命周期。`open` 创建并销毁自己的 Engine；`attach` 接入 Flutter Runner 的现有 Engine，由 Runner 保持 Engine、View 和平台回调的所有权。
 
-公开预览配对为 FlutterHull `0.1.0-preview.2`、`aeris_flutter` `0.26.0-preview.3`、Aeris Native `0.26.0-preview.2`。当前为预览版本，请按应用的目标设备和插件组合验证集成。
+公开预览配对为 FlutterHull `0.2.0-preview.1`、`aeris_flutter` `0.26.0-preview.3`、Aeris Native `0.26.0-preview.2`。当前为预览版本，请按应用的目标设备和插件组合验证集成。
 
 ## 环境与依赖
 
@@ -12,7 +12,7 @@ Dart `>=3.13.7 <4.0.0`、Flutter `>=3.47.8`；iOS 15.0+；Android minSdk 24、co
 dependencies:
   flutter:
     sdk: flutter
-  flutter_hull: 0.1.0-preview.2
+  flutter_hull: 0.2.0-preview.1
 flutter:
   uses-material-design: true
   config:
@@ -254,3 +254,20 @@ Dart `runtime.finish(result)` 请求结束整个容器，只有 Native 配置了
 配置真实 Native 绑定后运行 `flutter run`。构建检查可使用 `flutter build apk --release --target-platform android-arm64` 和 `flutter build ios --release --no-codesign`；无签名编译不能替代真机安装验收。
 
 升级时同时检查上述三项配对版本、应用锁文件和 Native 依赖解析结果。保留上一套已在自己应用验收的锁文件、平台配置及应用制品用于整体回滚；旧预览版本需连同其配套 Aeris 依赖一起回滚。已发布版本和 tag 保持不变，后续修复使用新版本。
+
+## 路由、状态与宿主环境
+
+FlutterHullRouting与Runtime/PageScope.openURL、openTarget接入宿主路由表和跨栈dispatcher，支持有界冷队列、来源隔离和真实取消清理。FlutterHullModule声明业务版本、参数契约、基线及requiredCapabilities。
+
+Route.captureState/applyState接入业务JSON状态；切换用户后不捕获旧页面的参数、state或data。connect.failurePolicy提供有限次数与冷却，默认只有超时或明确运行故障触发降级，宿主可用shouldFallback显式分类。
+
+EngineManager.prewarm创建待消费Engine，首次owned open消费；预热Engine不得重复作为external attach。原生通过setEnvironment同步主题、语言、字体和窗口快照；PageScope.observeEnvironment在关闭时解除监听。openEmbedded/updateEmbeddedFrame/unmountEmbedded用于局部区域，清理失败保留owner直到显式恢复。
+
+开发时显式挂载FlutterHullDiagnosticsPanel，exportDiagnosticReport输出本地脱敏报告。安装与升级检查：
+
+```sh
+dart run flutter_hull doctor --app /absolute/flutter-app
+dart run flutter_hull upgrade --app /absolute/flutter-app --target /absolute/target.json --dry-run
+```
+
+升级命令只输出差异，不修改锁文件。Host存储、认证、目标UI与实际插件能力由接入项目提供。

@@ -5,7 +5,13 @@ final class FlutterHullRouteState {
   final String route;
   final Map<String, Object?> arguments;
   final Map<String, Object?> state;
-  FlutterHullRouteState._(this.route, this.arguments, this.state);
+  final Map<String, Object?>? module;
+  FlutterHullRouteState._(
+    this.route,
+    this.arguments,
+    this.state, [
+    this.module,
+  ]);
 
   /// 业务 schema 迁移仅携带可复制的数据；完整栈仍会再次校验。
   factory FlutterHullRouteState({
@@ -26,13 +32,20 @@ final class FlutterHullRouteState {
 
 final class FlutterHullRestorationSnapshot {
   final List<FlutterHullRouteState> routes;
+  final String? userDomain;
   final String _encoded;
-  FlutterHullRestorationSnapshot._(this.routes, this._encoded);
+  FlutterHullRestorationSnapshot._(this.routes, this._encoded, this.userDomain);
 
   factory FlutterHullRestorationSnapshot.fromMap(Object? value) {
     if (value is! Map || value['version'] != 1 || value['version'] is! int) {
       throw const FormatException('无效的恢复快照版本');
     }
+    final userDomain = value['userDomain'];
+    if (userDomain != null &&
+        (userDomain is! String ||
+            userDomain.isEmpty ||
+            userDomain.length > 256))
+      throw const FormatException('恢复用户域无效');
     final raw = value['routes'];
     if (raw is! List || raw.isEmpty || raw.length > 32) {
       throw const FormatException('恢复路由数量必须为1至32');
@@ -54,22 +67,29 @@ final class FlutterHullRestorationSnapshot {
           route,
           _restorationObject(item['arguments']),
           _restorationObject(item['state']),
+          item['module'] == null ? null : _restorationObject(item['module']),
         ),
       );
     }
     final normalized = _restorationObject({
       'version': 1,
+      if (userDomain != null) 'userDomain': userDomain,
       'routes': [
         for (final route in routes)
           {
             'route': route.route,
             'arguments': route.arguments,
             'state': route.state,
+            if (route.module != null) 'module': route.module,
           },
       ],
     });
     final encoded = jsonEncode(normalized);
-    return FlutterHullRestorationSnapshot._(List.unmodifiable(routes), encoded);
+    return FlutterHullRestorationSnapshot._(
+      List.unmodifiable(routes),
+      encoded,
+      userDomain as String?,
+    );
   }
 
   /// 返回副本，业务修改导出值不会污染当前快照。

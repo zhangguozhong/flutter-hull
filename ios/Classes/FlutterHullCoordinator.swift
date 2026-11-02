@@ -31,6 +31,9 @@ public final class FlutterHullDiagnostics {
   public var diagnostics = FlutterHullDiagnostics()
   /// 仅调试构建接收 runToken 变化；业务显式调用 helper 决定重开或交还 Runner。
   public var onDevelopmentReopenRequested: (() -> Void)?
+  private let routing = FlutterHullRoutingQueue()
+  public var availableCapabilities: Set<String> = []
+  public var baselineId: String?
   private var generation = 0
   private var openingStarted: TimeInterval = 0
   private var openingTimings: [String: Any] = [:]
@@ -45,6 +48,7 @@ public final class FlutterHullDiagnostics {
     result["managerEngineCount"] = engineManager.activeEngineCount
     result["cleanupPending"] = (record?.cleanup.pendingCount ?? 0) + (record?.dartBarrier.pendingCount ?? 0)
     result["navigation"] = record?.navigation?.activeCount ?? 0
+    result["routing"] = routing.count
     result["communicationReady"] = communicationReady
     result["firstFrameReady"] = firstFrameReady
     result["closing"] = record?.closing ?? false
@@ -65,6 +69,7 @@ public final class FlutterHullDiagnostics {
   private let bridgeEngine: BridgeEngine
   private let engineManager: FlutterHullEngineManager
   private let hostCallbacks: FlutterHullHostCallbacks?
+  public private(set) var environment: FlutterHullHostEnvironment?
   public private(set) var restorationState: [String: Any]?
   private let registerPlugins: (FlutterEngine) -> Void
   private let permissions: Set<String>
@@ -112,6 +117,45 @@ public final class FlutterHullDiagnostics {
   public var activeEngine: FlutterEngine? {
     record?.engineUnavailable == true ? nil : record?.engine
   }
+  /// 拒绝乱序更新；用户域切换同步使宿主恢复缓存失效。
+  @discardableResult public func setEnvironment(_ next: FlutterHullHostEnvironment) -> Bool {
+    guard next.revision > (environment?.revision ?? -1) else { return false }
+    if let previous = environment, previous.userDomain != next.userDomain {
+      restorationState = nil
+      routing.deactivate(code: "USER_DOMAIN_CHANGED")
+    }
+    environment = next
+    record?.control.setEnvironment(next)
+    if let current = record, current.communicationReady { activateRouting(current) }
+    return true
+  }
+  /// 可在 open 之前接入 Scene URL；握手完成后才导航到既有 Dart Navigator。
+  @discardableResult public func openURL(_ url: String, timeout: TimeInterval = 30,
+    completion: @escaping (Result<[String: Any]?, Error>) -> Void) throws -> FlutterHullRoutingOperation {
+    guard record?.closing != true else { throw FlutterHullFailure.closed }
+    guard !url.isEmpty, url.utf8.count <= 4096 else { throw FlutterHullCleanupError(code: "INVALID_URL") }
+    return routing.open(method: "openURL", arguments: ["url": url], dedupe: url,
+      timeout: timeout, completion: completion)
+  }
+  @discardableResult public func openTarget(kind: String, route: String, arguments: [String: Any] = [:],
+    timeout: TimeInterval = 30, completion: @escaping (Result<[String: Any]?, Error>) -> Void) throws -> FlutterHullRoutingOperation {
+    guard record?.closing != true else { throw FlutterHullFailure.closed }
+    guard ["flutter", "native", "rn", "web"].contains(kind), !route.isEmpty, route.utf8.count <= 512 else {
+      throw FlutterHullCleanupError(code: "INVALID_TARGET")
+    }
+    return routing.open(method: "openTarget", arguments: ["kind": kind, "route": route,
+      "arguments": try FlutterHullJSON.object(arguments)], timeout: timeout, completion: completion)
+  }
+  private func activateRouting(_ current: Record) {
+    routing.activate(send: { [weak self, weak current] method, arguments, completion in
+      guard let self, let current, self.record === current, !current.closing else {
+        completion(.failure(FlutterHullFailure.closed))
+        return
+      }
+      current.control.sendRouting(method, arguments: arguments, completion: completion)
+    }, cancel: { [weak current] id in current?.control.cancelRouting(id) })
+  }
+
   public func setVisible(_ visible: Bool) {
     hostVisible = visible
     record?.control.setLifecycle(visible: visible)
@@ -125,6 +169,7 @@ public final class FlutterHullDiagnostics {
       completion(true)
       return
     }
+    if record.embedded && (!record.ownsBack || !hostVisible) { completion(false); return }
     record.control.requestBack(completion)
   }
   public var engineOwnership: FlutterHullEngineOwnership? { record?.ownership }
@@ -156,7 +201,7 @@ public final class FlutterHullDiagnostics {
     diagnose("dartStarted")
     let engine = lease.engine
     let pluginStartedAt = diagnostics.now()
-    registerPlugins(engine)
+    lease.configurePlugins(registerPlugins)
     openingTimings["pluginConfigureMs"] = max(0, diagnostics.now() - pluginStartedAt) * 1000
     diagnose("pluginsConfigured")
     let viewStartedAt = diagnostics.now()
@@ -181,11 +226,56 @@ public final class FlutterHullDiagnostics {
       throw error
     }
   }
+  /// 局部区域使用标准 child ViewController 关系；兄弟视图保持宿主所有权。
+  @discardableResult public func openEmbedded(
+    in parent: UIViewController, container: UIView, frame: CGRect,
+    route: String = "/", arguments: [String: Any] = [:], restorationState: [String: Any]? = nil
+  ) throws -> UIViewController {
+    parent.loadViewIfNeeded()
+    guard container === parent.view || container.isDescendant(of: parent.view),
+      frame.origin.x.isFinite, frame.origin.y.isFinite,
+      frame.width.isFinite, frame.height.isFinite, frame.width >= 0, frame.height >= 0 else {
+      throw FlutterHullFailure.invalidContext
+    }
+    let page = try open(route: route, arguments: arguments, restorationState: restorationState)
+    record?.embedded = true
+    parent.addChild(page)
+    page.view.frame = frame
+    container.addSubview(page.view)
+    page.didMove(toParent: parent)
+    return page
+  }
+  @discardableResult public func updateEmbeddedFrame(_ frame: CGRect) -> Bool {
+    guard let current = record, current.embedded, !current.closing,
+      frame.origin.x.isFinite, frame.origin.y.isFinite, frame.width.isFinite, frame.height.isFinite,
+      frame.width >= 0, frame.height >= 0 else { return false }
+    current.page?.view.frame = frame
+    return true
+  }
+  public func setEmbeddedVisible(_ visible: Bool) {
+    guard let current = record, current.embedded, !current.closing else { return }
+    current.page?.view.isHidden = !visible
+    setVisible(visible)
+  }
+  public func setEmbeddedBackOwnership(_ ownsBack: Bool) {
+    guard let current = record, current.embedded, !current.closing else { return }
+    current.ownsBack = ownsBack
+  }
+  /// close 超时或失败保留 child 与 owner；retryCleanup 推进后由真实 drain 移除。
+  public func unmountEmbedded(timeout: TimeInterval = 5, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard record == nil || record?.embedded == true else {
+      completion(.failure(FlutterHullFailure.invalidOwnership))
+      return
+    }
+    close(timeout: timeout, completion: completion)
+  }
+
   public func attach(
     to engine: FlutterEngine, viewController: FlutterViewController,
     route: String = "/", arguments: [String: Any] = [:]
   ) throws {
     try validate(route: route, arguments: arguments)
+    guard !FlutterHullEngineManager.ownsManagedEngine(engine) else { throw FlutterHullFailure.engineInUse }
     openingStarted = diagnostics.now()
     openingTimings = [:]
     guard viewController.engine === engine, engine.viewController === viewController else {
@@ -279,6 +369,7 @@ public final class FlutterHullDiagnostics {
         current.communicationReady = true
         current.timings["engineReadyMs"] = (self.diagnostics.now() - current.startedAt) * 1000
         self.diagnose("communicationReady")
+        self.activateRouting(current)
       }
       control.onFirstFrame = { [weak self, weak current] in
         guard let self, let current, self.record === current, !current.closing,
@@ -303,11 +394,14 @@ public final class FlutterHullDiagnostics {
         guard let self, let current, self.record === current else { return }
         self.engineWillDestroy()
       }
+      if let environment { control.setEnvironment(environment) }
       control.setLifecycle(visible: hostVisible, foreground: hostForeground)
       var configuration: [String: Any] = [
         "containerId": current.id, "route": route, "arguments": copiedArguments,
         "canFinishContainer": onCloseRequested != nil,
+        "availableCapabilities": availableCapabilities.sorted(),
       ]
+      if let baselineId { configuration["baselineId"] = baselineId }
       if let restoration { configuration["restoration"] = restoration }
       control.configure(configuration)
     } catch {
@@ -399,6 +493,7 @@ public final class FlutterHullDiagnostics {
   private func beginClose(_ current: Record, timeout: TimeInterval, skipDart: Bool) {
     if !current.closing {
       let closeDeadline = DispatchTime.now() + max(0, timeout)
+      routing.deactivate(code: "CLOSED")
       current.closing = true
       current.closeStartedAt = diagnostics.now()
       diagnose("closing")
@@ -498,6 +593,7 @@ public final class FlutterHullDiagnostics {
   }
   @MainActor private final class Record {
     let id = UUID().uuidString
+    var embedded = false, ownsBack = true
     var initialRoute = "/"
     var arguments: [String: Any] = [:]
     var startedAt: TimeInterval = 0

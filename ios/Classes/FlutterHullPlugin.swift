@@ -5,6 +5,8 @@ import Foundation
 public final class FlutterHullPlugin: NSObject, FlutterPlugin {
   private let channel: FlutterMethodChannel
   private var configuration: [String: Any]?
+  private var prewarmDeadline: TimeInterval?
+  private var environment: FlutterHullHostEnvironment?
   private var runToken: String?
   private var closing = false
   private var reserved = false
@@ -39,13 +41,32 @@ public final class FlutterHullPlugin: NSObject, FlutterPlugin {
     reserved = true
   }
   func releaseReservation() { if configuration == nil && !closing { reserved = false } }
+  func markPrewarming(ttl: TimeInterval) {
+    guard !closing, configuration == nil else { return }
+    prewarmDeadline = ProcessInfo.processInfo.systemUptime + ttl
+  }
   func configure(_ configuration: [String: Any]) {
+    var configuration = configuration
+    if let environment { configuration["environment"] = environment.toMap }
     self.configuration = configuration.merging([
       "visible": visible, "foreground": foreground, "lifecycleRevision": lifecycleRevision,
       "supportsRestoration": true,
     ]) {
       _, new in new
     }
+  }
+  @discardableResult func setEnvironment(_ next: FlutterHullHostEnvironment) -> Bool {
+    guard !closing, transportAvailable, next.revision > (environment?.revision ?? -1) else { return false }
+    let changedDomain = environment != nil && environment?.userDomain != next.userDomain
+    environment = next
+    guard var value = configuration else { return true }
+    value["environment"] = next.toMap
+    if changedDomain { value.removeValue(forKey: "restoration") }
+    configuration = value
+    channel.invokeMethod("hostEnvironment", arguments: [
+      "containerId": value["containerId"] ?? "", "environment": next.toMap,
+    ])
+    return true
   }
   func setLifecycle(visible: Bool? = nil, foreground: Bool? = nil) {
     lifecycleRevision += 1
@@ -62,6 +83,21 @@ public final class FlutterHullPlugin: NSObject, FlutterPlugin {
         "containerId": value["containerId"] ?? "", "visible": self.visible,
         "foreground": self.foreground, "lifecycleRevision": lifecycleRevision,
       ])
+  }
+  func sendRouting(_ method: String, arguments: [String: Any],
+    completion: @escaping (Result<[String: Any]?, Error>) -> Void) {
+    guard !closing, transportAvailable else { completion(.failure(FlutterHullFailure.closed)); return }
+    channel.invokeMethod(method, arguments: arguments) { value in
+      if let error = value as? FlutterError { completion(.failure(FlutterHullCleanupError(code: error.code))) }
+      else if value == nil { completion(.success(nil)) }
+      else if let map = value as? [String: Any], let copied = try? FlutterHullJSON.object(map) {
+        completion(.success(copied))
+      } else { completion(.failure(FlutterHullCleanupError(code: "NAVIGATION_INVALID_RESULT"))) }
+    }
+  }
+  func cancelRouting(_ requestId: String) {
+    guard !closing, transportAvailable else { return }
+    channel.invokeMethod("cancelRouting", arguments: ["requestId": requestId])
   }
   func requestBack(_ completion: @escaping (Bool) -> Void) {
     guard !closing, transportAvailable else {
@@ -107,6 +143,10 @@ public final class FlutterHullPlugin: NSObject, FlutterPlugin {
         return
       }
       guard let configuration else {
+        if let deadline = prewarmDeadline {
+          let remaining = Int(max(0, deadline - ProcessInfo.processInfo.systemUptime) * 1000)
+          if remaining > 0 { result(["prewarming": true, "remainingMs": remaining]); return }
+        }
         result(FlutterError(code: "NOT_READY", message: "原生绑定尚未完成", details: nil))
         return
       }
@@ -125,6 +165,11 @@ public final class FlutterHullPlugin: NSObject, FlutterPlugin {
         let snapshot = input["snapshot"], let copied = try? FlutterHullRestoration.copy(snapshot)
       else {
         result(FlutterError(code: "INVALID_ARGUMENT", message: "页面快照无效或容器已替换", details: nil))
+        return
+      }
+      if let environment,
+        (copied["userDomain"] as? String ?? "anonymous") != environment.userDomain {
+        result(false)
         return
       }
       guard revision > restorationRevision else {

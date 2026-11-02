@@ -12,6 +12,15 @@ typedef FlutterHullPageStateBuilder = Widget Function(
 
 class FlutterHullRoute {
   final String title;
+  final FlutterHullModule? module;
+  final FutureOr<Map<String, Object?>> Function(FlutterHullPageScope, Object?)?
+  captureState;
+  final FutureOr<void> Function(
+    FlutterHullPageScope,
+    Object?,
+    Map<String, Object?>,
+  )?
+  applyState;
   final Duration? loadTimeout;
   final Duration cleanupWaitTimeout;
   final FlutterHullRouteFactory? routeFactory;
@@ -24,6 +33,9 @@ class FlutterHullRoute {
   builder;
   const FlutterHullRoute({
     this.title = '',
+    this.module,
+    this.captureState,
+    this.applyState,
     this.loadTimeout = const Duration(seconds: 30),
     this.cleanupWaitTimeout = const Duration(seconds: 5),
     this.routeFactory,
@@ -41,9 +53,11 @@ class _HullRouteRecord {
   final FlutterHullPageController page;
   late final PageRoute<Map<String, Object?>?> route;
   final Object admission;
+  final String userDomain;
   bool returning = false;
   Map<String, Object?> restorationState = const {};
-  _HullRouteRecord(this.definition, this.page, this.admission);
+  bool restoring = false;
+  _HullRouteRecord(this.definition, this.page, this.admission, this.userDomain);
 }
 
 /// 使用 Flutter 标准路由；不为内部业务页创建第二个 Native 容器或 Client。
@@ -58,6 +72,10 @@ class FlutterHullNavigator {
   // 预留先于自定义工厂执行，防止同步重入绕过容量。
   final _admissions = <Object, Map<String, Object?>>{};
   int _constructionDepth = 0;
+  String? _initialRestoreId;
+  final _initialRestorePending = <_HullRouteRecord>{};
+  String _initialFallback = '/';
+  int _initialRestoreEpoch = 0;
   bool _disposed = false;
   bool _saveScheduled = false;
   bool _returning = false;
@@ -67,10 +85,78 @@ class FlutterHullNavigator {
     this.onAutoSaveError,
     required Map<String, FlutterHullRoute> routes,
   }) : routes = Map.unmodifiable(routes) {
+    final versions = <String, String>{};
+    for (final route in routes.values) {
+      final module = route.module;
+      if (module == null) continue;
+      final previous = versions[module.id];
+      if (previous != null && previous != module.version)
+        throw const FormatException('模块版本声明冲突');
+      versions[module.id] = module.version;
+    }
     if (runtime._navigation != null) throw StateError('此 Runtime 已有导航实例');
     runtime._ensureOpen();
     runtime._navigation = this;
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => runtime._drainRouting(),
+    );
   }
+  List<Map<String, Object?>> get moduleManifest => List.unmodifiable([
+    for (final entry in routes.entries)
+      {
+        'route': entry.key,
+        if (entry.value.module case final module?) 'module': module.toMap(),
+      },
+  ]);
+  void _preflight(FlutterHullRoute definition) {
+    final baseline = definition.module?.baseline;
+    if (baseline != null && baseline != runtime.baselineId)
+      throw const BridgeError('BASELINE_INCOMPATIBLE', '模块与宿主实际基线不兼容');
+    final missing =
+        definition.module?.requiredCapabilities.difference(
+          runtime._availableCapabilities,
+        ) ??
+        const <String>{};
+    if (missing.isNotEmpty)
+      throw const BridgeError('CAPABILITY_MISSING', '宿主缺少模块所需能力');
+  }
+
+  FlutterHullDispatchOperation _dispatchTarget(FlutterHullTarget target) {
+    final state = key.currentState;
+    if (state == null) throw StateError('Navigator尚未挂载');
+    final route = onGenerateRoute(
+      RouteSettings(name: target.route, arguments: target.arguments),
+    );
+    if (route is! PageRoute<Map<String, Object?>?>)
+      throw const BridgeError('ROUTE_NOT_FOUND', 'Flutter路由未注册');
+    final record = _records[route];
+    record?.page._fallbackHistory = target._fallbackHistory;
+    Future<void> cleanup() async {
+      await record?.page.close();
+      await record?.page._scope?.whenDrained;
+      if (route.isActive) {
+        state.removeRoute(route);
+      } else if (_records.remove(route) != null) {
+        if (record != null) _admissions.remove(record.admission);
+        route.dispose();
+      }
+    }
+
+    try {
+      state.push(route);
+      return FlutterHullDispatchOperation(
+        result: route.completed,
+        cancel: cleanup,
+      );
+    } catch (error, stack) {
+      // 将安装失败也交给同一owner清理；清理失败不能直接释放准入记录。
+      return FlutterHullDispatchOperation(
+        result: Future.error(error, stack),
+        cancel: cleanup,
+      );
+    }
+  }
+
   Route<dynamic>? onGenerateRoute(RouteSettings settings) {
     // 标准pushNamed也必须等待当前工厂事务结束，避免提前安装子路由。
     if (_constructionDepth > 0) {
@@ -83,6 +169,7 @@ class FlutterHullNavigator {
       return null;
     final definition = routes[name];
     if (definition == null) return null;
+    _preflight(definition);
     final copiedSettings = RouteSettings(
       name: name,
       arguments: settings.arguments == null
@@ -95,6 +182,8 @@ class FlutterHullNavigator {
       'route': name,
       'arguments': copiedSettings.arguments ?? <String, Object?>{},
       'state': <String, Object?>{},
+      if (definition.module case final module?)
+        'module': _moduleIdentity(module),
     };
     FlutterHullRestorationSnapshot.fromMap({
       'version': 1,
@@ -111,7 +200,12 @@ class FlutterHullNavigator {
         loadTimeout: definition.loadTimeout,
         cleanupWaitTimeout: definition.cleanupWaitTimeout,
       );
-      final record = _HullRouteRecord(definition, page, token);
+      final record = _HullRouteRecord(
+        definition,
+        page,
+        token,
+        runtime.environment.userDomain,
+      );
       page._route = record;
       final factory = definition.routeFactory;
       candidate = factory == null
@@ -161,6 +255,8 @@ class FlutterHullNavigator {
         ...entry.value,
         if (record != null)
           'state': overrides[record] ?? record.restorationState,
+        if (record?.definition.module case final module?)
+          'module': _moduleIdentity(module),
       };
     }
   }
@@ -185,7 +281,10 @@ class FlutterHullNavigator {
   List<Route<dynamic>> initialRoutes(String initialRoute) {
     final before = _admissions.keys.toSet();
     final restored = runtime.restoration;
-    if (restored != null) {
+    if (restored != null &&
+        ((restored.userDomain == null &&
+                runtime.environment.userDomain == 'anonymous') ||
+            restored.userDomain == runtime.environment.userDomain)) {
       try {
         // 先迁移并校验整栈，成功后才创建页面，避免半栈和旧资源泄漏。
         final migrated = FlutterHullRestorationSnapshot.fromMap({
@@ -195,7 +294,16 @@ class FlutterHullNavigator {
         final restoredRoutes = [
           for (final value in migrated.routes) _restoreRoute(value),
         ];
-        runtime._diagnose('restoration.accepted');
+        _initialFallback = initialRoute;
+        _initialRestoreEpoch = runtime._routingEpoch;
+        final id = 'initialRestore:${++runtime._pageSerial}';
+        _initialRestoreId = id;
+        final records = [
+          for (final route in restoredRoutes)
+            if (_records[route] case final record?) record,
+        ];
+        _restoreOwners[id] = records;
+        _initialRestorePending.addAll(records);
         return restoredRoutes;
       } catch (_) {
         _rollbackAdmissions(before);
@@ -213,15 +321,63 @@ class FlutterHullNavigator {
     return [route];
   }
 
+  void _initialPageRestored(_HullRouteRecord record) {
+    if (!_initialRestorePending.contains(record)) return;
+    if (_initialRestoreEpoch != runtime._routingEpoch) {
+      unawaited(_initialRestoreFailed(record));
+      return;
+    }
+    _initialRestorePending.remove(record);
+    if (_initialRestorePending.isEmpty) {
+      final id = _initialRestoreId;
+      _initialRestoreId = null;
+      _restoreOwners.remove(id);
+      runtime._diagnose('restoration.accepted');
+      _scheduleSave();
+    }
+  }
+
+  Future<void> _initialRestoreFailed(_HullRouteRecord record) async {
+    final id = _initialRestoreId;
+    if (id == null || !(_restoreOwners[id]?.contains(record) ?? false)) return;
+    _initialRestoreId = null;
+    _initialRestorePending.clear();
+    _restoreFallbacks[id] = _initialFallback;
+    runtime._diagnose(
+      'restoration.rejected',
+      errorCode: 'RESTORATION_APPLY_FAILED',
+    );
+    // 初始栈还没有提交；等待整轮真实清理，失败保留owner供显式重试。
+    try {
+      await retryRestorationCleanup(id);
+    } catch (_) {
+      runtime._diagnose(
+        'restoration.rollbackFailed',
+        errorCode: 'CLEANUP_FAILED',
+      );
+      return;
+    }
+  }
+
   Map<String, Object?> _migrateRoute(FlutterHullRouteState value) {
     final definition = routes[value.route];
     if (definition == null) throw const FormatException('恢复路由未注册');
+    _preflight(definition);
+    final module = definition.module;
+    final savedModule = value.module;
+    if ((module != null && savedModule == null) ||
+        (savedModule != null &&
+            (module == null ||
+                !_sameModule(savedModule, _moduleIdentity(module)))))
+      throw const FormatException('恢复模块基线不兼容');
     final migrated = definition.restore?.call(value) ?? value;
     if (migrated.route != value.route) throw const FormatException('迁移不能替换路由');
     return {
       'route': migrated.route,
       'arguments': migrated.arguments,
       'state': migrated.state,
+      if (definition.module case final module?)
+        'module': _moduleIdentity(module),
     };
   }
 
@@ -232,6 +388,7 @@ class FlutterHullNavigator {
     final record = _records[route];
     if (route == null || record == null) throw StateError('恢复路由创建失败');
     record.restorationState = value.state;
+    record.restoring = true;
     return route;
   }
 
@@ -247,30 +404,168 @@ class FlutterHullNavigator {
     }
     return FlutterHullRestorationSnapshot.fromMap({
       'version': 1,
+      'userDomain': runtime.environment.userDomain,
       'routes': [
         for (final route in _stack)
           if (_records[route] case final record?)
-            if (!record.returning)
+            if (!record.returning &&
+                record.userDomain == runtime.environment.userDomain)
               {
                 'route': record.route.settings.name,
                 'arguments':
                     record.route.settings.arguments ?? <String, Object?>{},
                 'state': overrides[record] ?? record.restorationState,
+                if (record.definition.module case final module?)
+                  'module': _moduleIdentity(module),
               },
       ],
     });
   }
 
-  Future<void> saveState() {
+  Future<void> saveState() async {
     if (_disposed || runtime._closed)
       return Future.error(const BridgeError('CLOSED', '导航已关闭'));
-    return runtime._saveRestoration(_snapshot());
+    final epoch = runtime._routingEpoch;
+    final captured = <_HullRouteRecord, Map<String, Object?>>{};
+    for (final record in _records.values.toList()) {
+      if (record.userDomain != runtime.environment.userDomain) continue;
+      final capture = record.definition.captureState;
+      final scope = record.page._scope;
+      if (capture != null && scope != null && !scope._closed)
+        captured[record] = _restorationObject(
+          await capture(scope, record.page.data),
+        );
+    }
+    if (epoch != runtime._routingEpoch || _disposed || runtime._closed)
+      throw const BridgeError('CANCELLED', '保存状态所属用户域已改变');
+    final snapshot = _snapshot(overrides: captured);
+    await runtime._saveRestoration(snapshot);
+    if (epoch != runtime._routingEpoch)
+      throw const BridgeError('CANCELLED', '保存状态所属用户域已改变');
+    for (final entry in captured.entries) {
+      entry.key.restorationState = entry.value;
+    }
   }
+
+  final _restoreOwners = <String, List<_HullRouteRecord>>{};
+  final _restoreFallbacks = <String, String>{};
+  List<String> get restorationCleanupIds =>
+      List.unmodifiable(_restoreOwners.keys);
+  Future<void> retryRestorationCleanup(String id) async {
+    final records = _restoreOwners[id];
+    if (records == null) return;
+    Object? failure;
+    for (final record in records.toList()) {
+      try {
+        await record.page.close();
+        await record.page._scope?.whenDrained;
+        if (record.route.isActive) {
+          key.currentState?.removeRoute(record.route);
+        } else {
+          _records.remove(record.route);
+          _admissions.remove(record.admission);
+          record.route.dispose();
+        }
+        records.remove(record);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (records.isEmpty) {
+      _restoreOwners.remove(id);
+      final fallback = _restoreFallbacks.remove(id);
+      if (fallback != null && !_disposed && !runtime._closed) {
+        final route = onGenerateRoute(
+          RouteSettings(name: fallback, arguments: runtime.arguments),
+        );
+        if (route != null) key.currentState?.push(route);
+      }
+    }
+    if (failure != null) throw failure;
+  }
+
+  /// 读取、状态应用、整栈准入为一个事务；失败仅回收本轮资源。
+  Future<void> restoreSnapshot(
+    FutureOr<FlutterHullRestorationSnapshot> Function() read,
+  ) async {
+    final epoch = runtime._routingEpoch, user = runtime.environment.userDomain;
+    void valid() {
+      if (_disposed ||
+          runtime._closed ||
+          epoch != runtime._routingEpoch ||
+          user != runtime.environment.userDomain)
+        throw const BridgeError('CANCELLED', '恢复生命周期已失效');
+    }
+
+    valid();
+    final snapshot = await runtime._duringEpoch(
+      Future<FlutterHullRestorationSnapshot>.sync(read),
+      epoch,
+    );
+    valid();
+    if ((snapshot.userDomain == null && user != 'anonymous') ||
+        (snapshot.userDomain != null && snapshot.userDomain != user))
+      throw const BridgeError('RESTORATION_INCOMPATIBLE', '恢复用户域不兼容');
+    final migrated = FlutterHullRestorationSnapshot.fromMap({
+      'version': 1,
+      'userDomain': user,
+      'routes': [for (final value in snapshot.routes) _migrateRoute(value)],
+    });
+    final id = 'restore:${++runtime._pageSerial}';
+    final records = <_HullRouteRecord>[];
+    _restoreOwners[id] = records;
+    try {
+      for (final value in migrated.routes) {
+        valid();
+        final route = _restoreRoute(value);
+        final record = _records[route];
+        if (record == null) throw StateError('恢复记录丢失');
+        records.add(record);
+        await record.page.load();
+        valid();
+        if (record.page.state != FlutterHullLoadState.ready)
+          throw record.page.error ?? StateError('恢复页面未就绪');
+      }
+      valid();
+      final state = key.currentState;
+      if (state == null) throw StateError('Navigator尚未挂载');
+      for (final record in records) {
+        valid();
+        state.push(record.route);
+      }
+      _restoreOwners.remove(id);
+      runtime._diagnose('restoration.accepted');
+    } catch (error, stack) {
+      try {
+        await retryRestorationCleanup(id);
+      } catch (_) {
+        runtime._diagnose(
+          'restoration.rollbackFailed',
+          errorCode: 'CLEANUP_FAILED',
+        );
+      }
+      Error.throwWithStackTrace(error, stack);
+    }
+  }
+
+  static bool _sameModule(
+    Map<String, Object?> left,
+    Map<String, Object?> right,
+  ) =>
+      left['id'] == right['id'] &&
+      left['version'] == right['version'] &&
+      left['baseline'] == right['baseline'];
+  static Map<String, Object?> _moduleIdentity(FlutterHullModule module) => {
+    'id': module.id,
+    'version': module.version,
+    if (module.baseline != null) 'baseline': module.baseline,
+  };
 
   FlutterHullRestorationSnapshot get restorationSnapshot => _snapshot();
 
   void _scheduleSave() {
-    if (_saveScheduled ||
+    if (_initialRestoreId != null ||
+        _saveScheduled ||
         _disposed ||
         runtime._closed ||
         !runtime._supportsRestoration)

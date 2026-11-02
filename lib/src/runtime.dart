@@ -14,6 +14,9 @@ part 'page.dart';
 part 'restoration.dart';
 part 'diagnostics.dart';
 part 'cleanup.dart';
+part 'capabilities.dart';
+part 'environment.dart';
+part 'failure_policy.dart';
 
 /// 每个 Messenger 唯一的容器环境。业务路由共享此环境，不自行创建 Client。
 final class FlutterHullRuntime with WidgetsBindingObserver {
@@ -23,6 +26,148 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
   final BinaryMessenger _messenger;
   final MethodChannel _control;
   final _pages = <FlutterHullPageScope>{};
+  FlutterHullRouting _routing = FlutterHullRouting();
+  FlutterHullFailurePolicy? _failurePolicy;
+  final _failureWindows = <String, _FailureWindow>{};
+  Set<String> _availableCapabilities = const {};
+  FlutterHullEnvironment _environment = const FlutterHullEnvironment();
+  FlutterHullEnvironment get environment => _environment;
+  int _routingEpoch = 0;
+  Completer<void> _epochChanged = Completer<void>();
+  String? _baselineId;
+  String? get baselineId => _baselineId;
+  Future<T> _duringEpoch<T>(Future<T> operation, int epoch) {
+    if (epoch != _routingEpoch)
+      return Future.error(const BridgeError('CANCELLED', '用户域生命周期已改变'));
+    return Future.any([
+      operation,
+      _epochChanged.future.then<T>(
+        (_) => throw const BridgeError('CANCELLED', '用户域生命周期已改变'),
+      ),
+    ]);
+  }
+
+  final _routingOwners = <String, _RoutingOwner>{};
+  final _routingDedup = <String, _RoutingOwner>{};
+  final _hostRoutingRequests = <String, FlutterHullRoutingRequest>{};
+  List<String> get routingCleanupIds => List.unmodifiable(
+    _routingOwners.values
+        .where((owner) => owner.cancelled && owner.operation != null)
+        .map((owner) => owner.id),
+  );
+  Future<void> retryRoutingCleanup(String id) async {
+    final owner = _routingOwners[id];
+    if (owner != null && owner.cancelled) await _cleanupRouting(owner);
+  }
+
+  List<Map<String, Object?>> get moduleManifest =>
+      _navigation?.moduleManifest ?? const [];
+  String exportDiagnosticReport() => jsonEncode({
+    'version': 1,
+    'snapshot': diagnosticSnapshot,
+    'events': diagnostics.events,
+  });
+
+  FlutterHullRoutingRequest openURL(Uri uri, {FlutterHullPageScope? page}) {
+    final target = _routing.links[uri.path];
+    if (target == null || uri.toString().length > 2048)
+      throw const BridgeError('ROUTE_NOT_FOUND', '外部URL未注册');
+    return openTarget(
+      FlutterHullTarget(
+        kind: target.kind,
+        route: target.route,
+        arguments: {...target.arguments, ...uri.queryParameters},
+      ),
+      page: page,
+      deduplicationKey: jsonEncode([
+        page?.pageId ?? containerId,
+        _routingEpoch,
+        uri.toString(),
+      ]),
+    );
+  }
+
+  FlutterHullRoutingRequest openTarget(
+    FlutterHullTarget target, {
+    FlutterHullPageScope? page,
+    String? deduplicationKey,
+  }) {
+    _ensureOpen();
+    if (page?._closed == true) throw const BridgeError('CLOSED', '调用页面已关闭');
+    final dedup = deduplicationKey == null
+        ? null
+        : _routingDedup[deduplicationKey];
+    if (dedup != null) return dedup.request;
+    if (_routingOwners.length >= _routing.queueLimit)
+      throw const BridgeError('BACKPRESSURE', '混合路由队列已满');
+    final owner = _RoutingOwner(
+      '$containerId:r${++_pageSerial}',
+      target,
+      _routingEpoch,
+      environment.userDomain,
+      page,
+    );
+    owner.request = FlutterHullRoutingRequest._(
+      owner.id,
+      owner.done.future,
+      () => _cancelRouting(owner),
+    );
+    _routingOwners[owner.id] = owner;
+    if (deduplicationKey != null) _routingDedup[deduplicationKey] = owner;
+    owner.timer = Timer(
+      _routing.timeout,
+      () => unawaited(
+        _cancelRouting(owner, 'NAVIGATION_TIMEOUT').catchError((Object _) {}),
+      ),
+    );
+    _drainRouting();
+    return owner.request;
+  }
+
+  void _receiveEnvironment(Object? value) {
+    if (_closed) return;
+    if (value is Map &&
+        value['containerId'] != null &&
+        value['containerId'] != containerId)
+      return;
+    try {
+      final next = FlutterHullEnvironment.fromMap(
+        value is Map && value['environment'] is Map
+            ? value['environment']
+            : value,
+      );
+      if (next.revision <= _environment.revision && _environmentReceived)
+        return;
+      final changed = next.userDomain != _environment.userDomain;
+      _environment = next;
+      _environmentReceived = true;
+      if (changed) {
+        for (final write in [_snapshotActive, _snapshotPending]) {
+          if (write != null && !write.done.isCompleted)
+            write.done.completeError(
+              const BridgeError('CANCELLED', '快照所属用户域已改变'),
+            );
+        }
+        _snapshotPending = null;
+        _restoration = null;
+        // 旧页面继续持有自己的参数；后续新建初始页不能继承旧用户启动参数。
+        arguments = const {};
+        _failureWindows.clear();
+        _invalidateRouting();
+      }
+      for (final page in _pages.toList()) {
+        for (final listener in page._environmentListeners.toList()) {
+          try {
+            listener(next);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {
+      _diagnose('environment.rejected', errorCode: 'INVALID_ENVIRONMENT');
+    }
+  }
+
+  bool _environmentReceived = false;
   final _controls = _ControlQueue();
   final _subscriptions = _ControlQueue();
   final _cleanupRetries = <FlutterHullPageScope, Timer>{};
@@ -70,6 +215,7 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
     if (!_closed ||
         !_connectionClosed ||
         _pages.isNotEmpty ||
+        _routingOwners.isNotEmpty ||
         _drained.isCompleted)
       return;
     _diagnose('drained');
@@ -100,6 +246,10 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
     BridgeAdapter? adapter,
     BinaryMessenger? messenger,
     Duration startupTimeout = const Duration(seconds: 8),
+    FlutterHullRouting? routing,
+    FlutterHullFailurePolicy? failurePolicy,
+    Set<String> availableCapabilities = const {},
+    String? baselineId,
     int cleanupLimitPerPage = 128,
     int cleanupLimitPerRuntime = 512,
   }) async {
@@ -117,6 +267,12 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
       cleanupLimitPerPage,
       cleanupLimitPerRuntime,
     );
+    runtime._routing = routing ?? FlutterHullRouting();
+    runtime._failurePolicy = failurePolicy;
+    if (baselineId != null && (baselineId.isEmpty || baselineId.length > 128))
+      throw ArgumentError.value(baselineId);
+    runtime._baselineId = baselineId;
+    runtime._availableCapabilities = Set.unmodifiable(availableCapabilities);
     _owners[target] = runtime;
     final initialState = WidgetsBinding.instance.lifecycleState;
     runtime._appForeground =
@@ -125,6 +281,62 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
         initialState == AppLifecycleState.inactive;
     WidgetsBinding.instance.addObserver(runtime);
     runtime._control.setMethodCallHandler((call) async {
+      if (call.method == 'openURL' || call.method == 'openTarget') {
+        final args = call.arguments;
+        if (args is! Map)
+          throw PlatformException(
+            code: 'INVALID_ARGUMENT',
+            message: '混合路由参数无效',
+          );
+        final requestId = args['requestId'];
+        if (requestId is! String || requestId.isEmpty || requestId.length > 256)
+          throw PlatformException(
+            code: 'INVALID_ARGUMENT',
+            message: 'requestId无效',
+          );
+        final previous = runtime._hostRoutingRequests[requestId];
+        if (previous != null) return previous.result;
+        final FlutterHullRoutingRequest request;
+        if (call.method == 'openURL') {
+          final url = args['url'];
+          if (url is! String)
+            throw PlatformException(code: 'INVALID_ARGUMENT', message: 'URL无效');
+          request = runtime.openURL(Uri.parse(url));
+        } else {
+          final route = args['route'];
+          final kind = FlutterHullTargetKind.values
+              .where((value) => value.name == args['kind'])
+              .firstOrNull;
+          if (route is! String || kind == null)
+            throw PlatformException(code: 'INVALID_ARGUMENT', message: '目标无效');
+          request = runtime.openTarget(
+            FlutterHullTarget(
+              kind: kind,
+              route: route,
+              arguments: args['arguments'] == null
+                  ? const {}
+                  : _restorationObject(args['arguments']),
+            ),
+          );
+        }
+        runtime._hostRoutingRequests[requestId] = request;
+        try {
+          return await request.result;
+        } finally {
+          runtime._hostRoutingRequests.remove(requestId);
+        }
+      }
+      if (call.method == 'cancelRouting') {
+        final args = call.arguments;
+        final id = args is Map ? args['requestId'] : null;
+        final request = runtime._hostRoutingRequests[id];
+        await request?.cancel();
+        return request != null;
+      }
+      if (call.method == 'hostEnvironment') {
+        runtime._receiveEnvironment(call.arguments);
+        return null;
+      }
       if (call.method == 'hostLifecycle') {
         final value = call.arguments;
         if (value is Map) runtime._receiveLifecycle(value);
@@ -132,6 +344,15 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
       }
       if (call.method == 'back')
         return runtime._navigation?.maybePop() ?? false;
+      if (call.method == 'routingCleanupIds') return runtime.routingCleanupIds;
+      if (call.method == 'retryRoutingCleanup') {
+        final args = call.arguments;
+        final id = args is Map ? args['requestId'] : null;
+        if (id is! String || !runtime.routingCleanupIds.contains(id))
+          return false;
+        await runtime.retryRoutingCleanup(id);
+        return true;
+      }
       if (call.method == 'cleanupResources')
         return runtime.queryCleanupResources()['items'];
       if (call.method == 'cleanupResourcesPage') {
@@ -161,7 +382,7 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
       return null;
     });
     try {
-      await runtime._start(adapter, startupTimeout).timeout(startupTimeout);
+      await runtime._start(adapter, startupTimeout);
       runtime._ensureOpen();
       return runtime;
     } catch (_) {
@@ -177,24 +398,43 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
     ).join('-');
     final watch = Stopwatch()..start();
     Map<Object?, Object?>? configuration;
+    var bootstrapBudget = timeout;
+    var prewarmingSeen = false;
     while (configuration == null) {
       _ensureOpen();
+      if (watch.elapsed >= bootstrapBudget)
+        throw TimeoutException('容器启动超时', bootstrapBudget);
       try {
         configuration = await Future.any<Map<Object?, Object?>?>([
-          _control.invokeMapMethod<Object?, Object?>('bootstrap', {
-            'runToken': token,
-          }),
+          _control
+              .invokeMapMethod<Object?, Object?>('bootstrap', {
+                'runToken': token,
+              })
+              .timeout(timeout),
           _closedSignal.future.then(
             (_) => throw const BridgeError('CLOSED', '启动已取消'),
           ),
         ]);
         if (configuration == null)
           throw const BridgeError('BOOTSTRAP_FAILED', '宿主未返回启动配置');
+        if (configuration['prewarming'] == true) {
+          final remaining = configuration['remainingMs'];
+          if (remaining is! int || remaining < 1 || remaining > 86400000)
+            throw const BridgeError('BOOTSTRAP_FAILED', '预热预算无效');
+          if (!prewarmingSeen) {
+            prewarmingSeen = true;
+            bootstrapBudget =
+                watch.elapsed + Duration(milliseconds: remaining) + timeout;
+          }
+          configuration = null;
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+        }
       } on MissingPluginException {
-        if (watch.elapsed >= timeout) rethrow;
+        if (watch.elapsed >= bootstrapBudget) rethrow;
         await Future<void>.delayed(const Duration(milliseconds: 25));
       } on PlatformException catch (error) {
-        if (error.code != 'NOT_READY' || watch.elapsed >= timeout) rethrow;
+        if (error.code != 'NOT_READY' || watch.elapsed >= bootstrapBudget)
+          rethrow;
         await Future<void>.delayed(const Duration(milliseconds: 25));
       }
     }
@@ -212,6 +452,30 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
       throw const BridgeError('BOOTSTRAP_FAILED', '无效的容器配置');
     }
     containerId = id;
+    final hostBaseline = configuration['baselineId'];
+    if (hostBaseline != null) {
+      if (hostBaseline is! String ||
+          hostBaseline.isEmpty ||
+          hostBaseline.length > 128 ||
+          (_baselineId != null && hostBaseline != _baselineId))
+        throw const BridgeError('BOOTSTRAP_FAILED', '宿主基线无效或冲突');
+      _baselineId = hostBaseline;
+    }
+    final hostCapabilities = configuration['availableCapabilities'];
+    if (hostCapabilities != null) {
+      if (hostCapabilities is! List ||
+          hostCapabilities.length > 256 ||
+          hostCapabilities.any(
+            (value) => value is! String || value.isEmpty || value.length > 128,
+          ))
+        throw const BridgeError('BOOTSTRAP_FAILED', '宿主能力清单无效');
+      _availableCapabilities = Set.unmodifiable({
+        ..._availableCapabilities,
+        ...hostCapabilities.cast<String>(),
+      });
+    }
+    if (configuration['environment'] != null)
+      _receiveEnvironment(configuration['environment']);
     _supportsRestoration = configuration['supportsRestoration'] == true;
     final restored = configuration['restoration'];
     if (restored != null)
@@ -228,7 +492,7 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
     );
     _bridge = bridge;
     await Future.any<void>([
-      bridge.ready(),
+      bridge.ready().timeout(timeout),
       _closedSignal.future.then(
         (_) => throw const BridgeError('CLOSED', '启动已取消'),
       ),
@@ -259,6 +523,8 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
     'snapshotWrites':
         (_snapshotActive == null ? 0 : 1) + (_snapshotPending == null ? 0 : 1),
     'cleanupResources': _resources.length,
+    'routingRequests': _routingOwners.length,
+    'restorationTransactions': _navigation?._restoreOwners.length ?? 0,
     'closed': _closed,
   });
 
@@ -459,6 +725,7 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
   Future<void> dispose() {
     if (_disposal != null) return _disposal ?? Future<void>.value();
     _closed = true;
+    _invalidateRouting();
     _diagnose('closing');
     for (final write in [_snapshotActive, _snapshotPending]) {
       write?.timer?.cancel();
@@ -480,6 +747,9 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
       Object? failure;
       final pages = _pages.toList();
       // 同时启动所有业务清理，但连接关闭只等待自己的桥接句柄。
+      final routingCleanup = Future.wait(
+        _routingOwners.values.toList().map(_waitRoutingCleanup),
+      ).then<Object?>((_) => null, onError: (Object error) => error);
       final business = Future.wait(
         pages.map((page) {
           page._seal();
@@ -503,6 +773,8 @@ final class FlutterHullRuntime with WidgetsBindingObserver {
         }
         _checkDrained();
       }
+      final routingFailure = await routingCleanup;
+      failure ??= routingFailure;
       failure ??= await business;
       if (failure != null)
         _diagnose('cleanupFailed', errorCode: 'CLEANUP_FAILED');

@@ -16,6 +16,20 @@ final class FlutterHullPageScope {
         : _runtime.arguments;
   }
 
+  final _environmentListeners = <void Function(FlutterHullEnvironment)>{};
+  FlutterHullEnvironment get environment => _runtime.environment;
+  VoidCallback observeEnvironment(
+    void Function(FlutterHullEnvironment) listener,
+  ) {
+    if (_closed) throw const BridgeError('CLOSED', '页面已关闭');
+    _environmentListeners.add(listener);
+    return () => _environmentListeners.remove(listener);
+  }
+
+  FlutterHullRoutingRequest openTarget(FlutterHullTarget target) =>
+      _runtime.openTarget(target, page: this);
+  FlutterHullRoutingRequest openURL(Uri uri) =>
+      _runtime.openURL(uri, page: this);
   final _closedSignal = Completer<void>();
   final _nativeNavigations = <String>{};
   bool _routeVisible = false;
@@ -28,11 +42,16 @@ final class FlutterHullPageScope {
     final route = _route;
     final navigation = _runtime._navigation;
     if (route == null || navigation == null) throw StateError('只有托管页面可以保存恢复状态');
+    if (route.userDomain != _runtime.environment.userDomain)
+      throw const BridgeError('RESTORATION_INCOMPATIBLE', '不能保存旧用户域页面状态');
     final copied = _restorationObject(value);
     // 先校验整份快照，再更新业务状态，失败时不留下超额的内存状态。
-    navigation._snapshot(overrides: {route: copied});
+    final epoch = _runtime._routingEpoch;
+    final snapshot = navigation._snapshot(overrides: {route: copied});
+    await _runtime._saveRestoration(snapshot);
+    if (_closed || epoch != _runtime._routingEpoch)
+      throw const BridgeError('CANCELLED', '恢复状态所属页面已改变');
     route.restorationState = copied;
-    await navigation.saveState();
   }
 
   void setVisible(bool visible) {
@@ -185,6 +204,13 @@ final class FlutterHullPageScope {
   }
 
   void _seal() {
+    _environmentListeners.clear();
+    for (final owner
+        in _runtime._routingOwners.values
+            .where((value) => identical(value.page, this))
+            .toList()) {
+      unawaited(_runtime._cancelRouting(owner).catchError((Object _) {}));
+    }
     if (!_closed) {
       _closed = true;
       if (!_closedSignal.isCompleted) _closedSignal.complete();
@@ -209,10 +235,28 @@ final class FlutterHullPageScope {
     }
   }
 
+  Future<void> _disposeRouting() async {
+    Object? failure;
+    for (final owner
+        in _runtime._routingOwners.values
+            .where((owner) => identical(owner.page, this))
+            .toList()) {
+      try {
+        await _runtime._waitRoutingCleanup(owner);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (failure != null) throw failure;
+  }
+
   void _checkDrained() {
     if (!_closed ||
         !_bridgeReleased ||
         _businessResources.isNotEmpty ||
+        _runtime._routingOwners.values.any(
+          (owner) => identical(owner.page, this),
+        ) ||
         _drained.isCompleted)
       return;
     _drained.complete();
@@ -226,15 +270,16 @@ final class FlutterHullPageScope {
     // 生命周期观察者可能同步重入，先发布同一逻辑关闭 Future。
     _disposal = done.future;
     _seal();
-    Future.wait([_disposeBridge(), _waitBusinessCleanup()]).then(
-      (_) {
-        done.complete();
-      },
-      onError: (Object error, StackTrace stack) {
-        _disposal = null;
-        done.completeError(error, stack);
-      },
-    );
+    Future.wait([_disposeBridge(), _waitBusinessCleanup(), _disposeRouting()])
+        .then(
+          (_) {
+            done.complete();
+          },
+          onError: (Object error, StackTrace stack) {
+            _disposal = null;
+            done.completeError(error, stack);
+          },
+        );
     return done.future;
   }
 

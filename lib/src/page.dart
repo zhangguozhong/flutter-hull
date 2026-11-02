@@ -16,6 +16,8 @@ class FlutterHullPageController extends ChangeNotifier {
   int _round = 0;
   bool _closed = false, _visible = false;
   Future<void>? _retrying;
+  FlutterHullRoutingRequest? _fallbackRequest;
+  Set<String> _fallbackHistory = const {};
   _HullRouteRecord? _route;
   FlutterHullPageController({
     required this.runtime,
@@ -47,6 +49,15 @@ class FlutterHullPageController extends ChangeNotifier {
 
   Future<void> _begin(int round) async {
     if (_closed || runtime._closed || round != _round) return;
+    final recordDomain = _route?.userDomain;
+    if (recordDomain != null &&
+        recordDomain != runtime.environment.userDomain) {
+      error = const BridgeError('RESTORATION_INCOMPATIBLE', '旧用户域页面不能重新加载');
+      state = FlutterHullLoadState.error;
+      notifyListeners();
+      return;
+    }
+    final epoch = runtime._routingEpoch;
     final fresh = runtime.createPageScope().._route = _route;
     _scope = fresh;
     fresh._lifecycle.addListener(() {
@@ -57,9 +68,11 @@ class FlutterHullPageController extends ChangeNotifier {
     runtime._diagnose('loadStarted', pageId: _scope?.pageId);
     error = null;
     notifyListeners();
+    var applyingRestoration = false;
+    final loadWatch = Stopwatch()..start();
     try {
       final loading = fresh._whileOpen(
-        Future<Object?>.sync(() => loader(fresh)),
+        runtime._duringEpoch(Future<Object?>.sync(() => loader(fresh)), epoch),
       );
       final deadline = loadTimeout;
       final value = await (deadline == null
@@ -70,9 +83,35 @@ class FlutterHullPageController extends ChangeNotifier {
         await close();
         return;
       }
+      if (epoch != runtime._routingEpoch)
+        throw const BridgeError('CANCELLED', '页面所属用户域已改变');
+      final record = _route;
+      if (record?.restoring == true) {
+        applyingRestoration = record?.definition.applyState != null;
+        final applying = runtime._duringEpoch(
+          fresh._whileOpen(
+            Future<void>.sync(
+              () => record?.definition.applyState?.call(
+                fresh,
+                value,
+                record.restorationState,
+              ),
+            ),
+          ),
+          epoch,
+        );
+        await (deadline == null
+            ? applying
+            : applying.timeout(deadline - loadWatch.elapsed));
+        if (_closed || round != _round || runtime._closed) return;
+        if (epoch != runtime._routingEpoch)
+          throw const BridgeError('CANCELLED', '恢复所属用户域已改变');
+        record?.restoring = false;
+      }
       data = value;
       state = FlutterHullLoadState.ready;
       runtime._diagnose('loadReady', pageId: fresh.pageId);
+      if (record != null) runtime._navigation?._initialPageRestored(record);
     } catch (failure) {
       if (_closed || round != _round) return;
       if (runtime._closed) {
@@ -89,6 +128,17 @@ class FlutterHullPageController extends ChangeNotifier {
         pageId: _scope?.pageId,
         errorCode: 'LOAD_FAILED',
       );
+      if (_route case final record?
+          when applyingRestoration ||
+              (record.restoring &&
+                  (record.definition.applyState != null ||
+                      record.definition.module != null)) ||
+              epoch != runtime._routingEpoch)
+        unawaited(
+          runtime._navigation?._initialRestoreFailed(record) ?? Future.value(),
+        );
+      if (_route?.restoring != true && epoch == runtime._routingEpoch)
+        unawaited(runtime._fallback(this, round, failure, fresh));
     }
     notifyListeners();
   }
@@ -100,6 +150,10 @@ class FlutterHullPageController extends ChangeNotifier {
     final done = Completer<void>();
     _retrying = done.future;
     final round = ++_round;
+    final fallback = _fallbackRequest;
+    _fallbackRequest = null;
+    if (fallback != null)
+      unawaited(fallback.cancel().catchError((Object _) {}));
     state = FlutterHullLoadState.waitingCleanup;
     runtime._diagnose('waitingCleanup', pageId: _scope?.pageId);
     error = null;
@@ -153,6 +207,9 @@ class FlutterHullPageController extends ChangeNotifier {
     if (!_closed) {
       _closed = true;
       ++_round;
+      final fallback = _fallbackRequest;
+      _fallbackRequest = null;
+      if (fallback != null) await fallback.cancel();
       state = FlutterHullLoadState.closed;
       notifyListeners();
     }

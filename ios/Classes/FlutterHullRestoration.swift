@@ -25,9 +25,31 @@ enum FlutterHullRestoration {
         let arguments = item["arguments"] as? NSDictionary,
         let state = item["state"] as? NSDictionary
       else { throw FlutterHullFailure.invalidRestorationState }
-      return ["route": route, "arguments": arguments, "state": state]
+      var result: [String: Any] = ["route": route, "arguments": arguments, "state": state]
+      if let rawModule = item["module"] {
+        guard let module = rawModule as? NSDictionary,
+          let id = module["id"] as? String, !id.isEmpty, id.utf8.count <= 128,
+          let version = module["version"] as? String, !version.isEmpty, version.utf8.count <= 128,
+          module["baseline"] == nil || module["baseline"] is String else {
+          throw FlutterHullFailure.invalidRestorationState
+        }
+        var copied: [String: Any] = ["id": id, "version": version]
+        if let baseline = module["baseline"] as? String {
+          guard !baseline.isEmpty, baseline.utf8.count <= 128 else { throw FlutterHullFailure.invalidRestorationState }
+          copied["baseline"] = baseline
+        }
+        result["module"] = copied
+      }
+      return result
     }
-    return try FlutterHullJSON.object(["version": 1, "routes": normalized])
+    var snapshot: [String: Any] = ["version": 1, "routes": normalized]
+    if let rawDomain = input["userDomain"] {
+      guard let domain = rawDomain as? String, !domain.isEmpty, domain.utf8.count <= 128 else {
+        throw FlutterHullFailure.invalidRestorationState
+      }
+      snapshot["userDomain"] = domain
+    }
+    return try FlutterHullJSON.object(snapshot)
   }
 }
 

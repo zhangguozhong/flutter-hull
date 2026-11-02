@@ -1,6 +1,8 @@
 name: flutter_hull
 description: Flutter 宿主管理 SDK，支持 iOS/Android 单／多引擎、页面导航与资源生命周期管理。
-version: 0.1.0-preview.2
+version: 0.2.0-preview.1
+executables:
+  flutter_hull:
 environment:
   sdk: '>=3.13.7 <4.0.0'
   flutter: '>=3.47.8'
@@ -8,7 +10,7 @@ dependencies:
   cupertino_icons: 1.0.8
   flutter:
     sdk: flutter
-  # 与下述原生 Pod 和 Gradle 依赖保持精确配套版本。
+  # 与原生 Pod/Gradle 共用 tooling/packaging/baseline.json 的完整提交。
   aeris_flutter: 0.26.0-preview.3
 dev_dependencies:
   flutter_test:

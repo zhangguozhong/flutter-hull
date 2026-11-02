@@ -7,7 +7,20 @@ public enum FlutterHullEnginePolicy { case single, group }
 @MainActor public final class FlutterHullEngineManager {
   public let policy: FlutterHullEnginePolicy
   public let maxEngines: Int
+  public let maxWarmEngines: Int
   private var leases: Set<UUID> = []
+  // 原始Engine引用不转移租约；含预热和销毁中Engine，external入口必须排他拒绝。
+  private static var managedEngines: Set<ObjectIdentifier> = []
+  static func ownsManagedEngine(_ engine: FlutterEngine) -> Bool {
+    managedEngines.contains(ObjectIdentifier(engine))
+  }
+  private struct WarmEngine {
+    let lease: FlutterHullEngineLease
+    let expiresAt: TimeInterval
+  }
+  private var warmEngines: [WarmEngine] = []
+  public var warmEngineCount: Int { warmEngines.count }
+  private var expiryTimer: Timer?
   private struct GroupGeneration {
     let id = UUID()
     let group = FlutterEngineGroup(name: "flutter_hull_group_" + UUID().uuidString, project: nil)
@@ -15,12 +28,69 @@ public enum FlutterHullEnginePolicy { case single, group }
   private var currentGroup: GroupGeneration?
   public var activeEngineCount: Int { leases.count }
 
-  public init(policy: FlutterHullEnginePolicy = .single, maxEngines: Int = 4) {
+  public init(policy: FlutterHullEnginePolicy = .single, maxEngines: Int = 4, maxWarmEngines: Int = 1) {
     self.policy = policy
     self.maxEngines = max(0, maxEngines)
+    self.maxWarmEngines = max(0, maxWarmEngines)
+  }
+
+  /// 预热只创建未绑定页面的新 Engine；第一次 acquire 消费同一租约。
+  @discardableResult public func prewarm(
+    ttl: TimeInterval = 30, registerPlugins: (FlutterEngine) -> Void
+  ) throws -> FlutterEngine {
+    trimWarmEngines()
+    guard ttl.isFinite, ttl > 0, ttl <= 86400, warmEngines.count < maxWarmEngines else {
+      throw FlutterHullFailure.engineInUse
+    }
+    let lease = try createLease()
+    lease.configurePlugins(registerPlugins)
+    guard let control = lease.engine.valuePublished(byPlugin: "FlutterHullPlugin") as? FlutterHullPlugin else {
+      lease.destroy()
+      throw FlutterHullFailure.pluginMissing
+    }
+    control.markPrewarming(ttl: ttl)
+    warmEngines.append(WarmEngine(lease: lease, expiresAt: ProcessInfo.processInfo.systemUptime + ttl))
+    scheduleExpiry()
+    return lease.engine
+  }
+
+  public func trimWarmEngines() {
+    let now = ProcessInfo.processInfo.systemUptime
+    let expired = warmEngines.filter { $0.expiresAt <= now }
+    warmEngines.removeAll { $0.expiresAt <= now }
+    expired.forEach { $0.lease.destroy() }
+    scheduleExpiry()
+  }
+
+  /// 宿主内存警告转发到此入口；活动和清理中租约始终不回收。
+  public func handleMemoryPressure() {
+    expiryTimer?.invalidate()
+    expiryTimer = nil
+    let removed = warmEngines
+    warmEngines.removeAll()
+    removed.forEach { $0.lease.destroy() }
+  }
+
+  private func scheduleExpiry() {
+    expiryTimer?.invalidate()
+    expiryTimer = nil
+    guard let deadline = warmEngines.map(\.expiresAt).min() else { return }
+    expiryTimer = Timer.scheduledTimer(withTimeInterval: max(0.001, deadline - ProcessInfo.processInfo.systemUptime), repeats: false) { [weak self] _ in
+      Task { @MainActor in self?.trimWarmEngines() }
+    }
   }
 
   func acquire(clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> FlutterHullEngineLease {
+    trimWarmEngines()
+    if !warmEngines.isEmpty {
+      let lease = warmEngines.removeFirst().lease
+      scheduleExpiry()
+      return lease
+    }
+    return try createLease(clock: clock)
+  }
+
+  private func createLease(clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> FlutterHullEngineLease {
     let capacity = policy == .single ? min(1, maxEngines) : maxEngines
     guard leases.count < capacity else { throw FlutterHullFailure.engineInUse }
     let id = UUID()
@@ -53,6 +123,8 @@ public enum FlutterHullEnginePolicy { case single, group }
       creationMs = max(0, clock() - startedAt) * 1000
     // isolateId 由 flutter/isolate 消息异步发布，就绪状态由控制通道握手确认。
     }
+    let engineIdentity = ObjectIdentifier(engine)
+    Self.managedEngines.insert(engineIdentity)
     return FlutterHullEngineLease(
       engine: engine,
       startupTimings: ["engineCreateMs": creationMs, "dartStartMs": dartStartMs,
@@ -63,7 +135,10 @@ public enum FlutterHullEnginePolicy { case single, group }
         // 更早 generation 的租约关闭，不得退休后来创建的 Group。
         if let generation, currentGroup?.id == generation { currentGroup = nil }
       },
-      release: { [self] in leases.remove(id) })
+      release: { [self] in
+        leases.remove(id)
+        Self.managedEngines.remove(engineIdentity)
+      })
   }
 }
 
@@ -71,6 +146,7 @@ public enum FlutterHullEnginePolicy { case single, group }
 @MainActor final class FlutterHullEngineLease {
   let engine: FlutterEngine
   let startupTimings: [String: Any]
+  private var pluginsConfigured = false
   private let beforeDestroy: () -> Void
   private var release: (() -> Void)?
   init(engine: FlutterEngine, startupTimings: [String: Any], beforeDestroy: @escaping () -> Void, release: @escaping () -> Void) {
@@ -78,6 +154,11 @@ public enum FlutterHullEnginePolicy { case single, group }
     self.startupTimings = startupTimings
     self.beforeDestroy = beforeDestroy
     self.release = release
+  }
+  func configurePlugins(_ register: (FlutterEngine) -> Void) {
+    guard !pluginsConfigured, release != nil else { return }
+    pluginsConfigured = true
+    register(engine)
   }
   func destroy() {
     guard let release else { return }

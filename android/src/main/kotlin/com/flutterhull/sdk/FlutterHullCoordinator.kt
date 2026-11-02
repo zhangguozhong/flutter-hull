@@ -92,6 +92,9 @@ class FlutterHullCoordinator(
     var diagnostics = FlutterHullDiagnostics()
     var onDevelopmentReopenRequested: (() -> Unit)? = null
     private var debuggable = false
+    private val routing = FlutterHullRoutingQueue()
+    var availableCapabilities: Set<String> = emptySet()
+    var baselineId: String? = null
     private var generation = 0
     private var openingStarted = 0L
     private var openingTimings = emptyMap<String, Any?>()
@@ -109,6 +112,7 @@ class FlutterHullCoordinator(
                     "managerEngineCount" to engineManager.activeEngineCount,
                     "cleanupPending" to ((record?.cleanup?.pendingCount ?: 0) + (record?.dartBarrier?.pendingCount ?: 0) + (record?.bridgeBarrier?.pendingCount ?: 0)),
                     "navigation" to (record?.navigation?.activeCount ?: 0),
+                    "routing" to routing.count,
                     "communicationReady" to communicationReady,
                     "firstFrameReady" to firstFrameReady,
                     "closing" to (record?.closing ?: false),
@@ -144,6 +148,8 @@ class FlutterHullCoordinator(
             firstFrameReady = { firstFrameReady },
             platform = { record?.takeUnless { it.closing }?.platformPlugin },
         )
+    var environment: FlutterHullHostEnvironment? = null
+        private set
     private var hostVisible = true
     private var hostForeground = true
     var onCloseRequested: (() -> Unit)? = null
@@ -227,7 +233,7 @@ class FlutterHullCoordinator(
         val view = FlutterView(activity)
         try {
             val pluginStart = diagnostics.now()
-            configureEngine(engine)
+            lease.configurePlugins(configureEngine)
             openingTimings = mapOf(
                 "engineCreateMs" to (createdAt - openingStarted) / 1_000_000.0,
                 "pluginConfigureMs" to (diagnostics.now() - pluginStart) / 1_000_000.0,
@@ -302,6 +308,45 @@ class FlutterHullCoordinator(
         }
     }
 
+    /** 局部区域沿用同一 FlutterView 与 Activity 所有权，原生兄弟视图保持原样。 */
+    fun openEmbedded(activity: ComponentActivity, parent: ViewGroup,
+        layout: ViewGroup.LayoutParams, route: String = "/",
+        arguments: Map<String, Any?> = emptyMap(), savedState: Bundle? = null): FrameLayout {
+        require(layout.width >= 0 && layout.height >= 0) { "INVALID_EMBEDDED_SIZE" }
+        val root = open(activity, parent, route, arguments, savedState)
+        record?.embedded = true
+        root.layoutParams = layout
+        root.requestLayout()
+        return root
+    }
+    fun updateEmbeddedLayout(layout: ViewGroup.LayoutParams): Boolean {
+        checkMain()
+        val current = record?.takeIf { it.embedded && !it.closing } ?: return false
+        require(layout.width >= 0 && layout.height >= 0) { "INVALID_EMBEDDED_SIZE" }
+        current.root?.layoutParams = layout
+        current.root?.requestLayout()
+        return true
+    }
+    fun setEmbeddedVisible(visible: Boolean) {
+        checkMain()
+        val current = record?.takeIf { it.embedded && !it.closing } ?: return
+        current.root?.visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        setVisible(visible)
+    }
+    fun setEmbeddedBackOwnership(ownsBack: Boolean) {
+        checkMain()
+        record?.takeIf { it.embedded && !it.closing }?.ownsBack = ownsBack
+    }
+    /** 失败保留 owner 与视图；资源恢复后实际 drain 才会 detach/remove。 */
+    fun unmountEmbedded(timeoutMillis: Long = 5000, completion: (Result<Unit>) -> Unit = {}) {
+        checkMain()
+        if (record != null && record?.embedded != true) {
+            completion(Result.failure(IllegalStateException("INVALID_OWNERSHIP")))
+            return
+        }
+        close(timeoutMillis, completion)
+    }
+
     /** 生命周期中只复制最后已确认快照，不等待 Dart 往返。插件状态单独由 hostCallbacks 转发。 */
     fun saveState(outState: Bundle) {
         checkMain()
@@ -319,6 +364,7 @@ class FlutterHullCoordinator(
         arguments: Map<String, Any?> = emptyMap(),
     ) {
         validate(route)
+        check(!FlutterHullManagedEngineRegistry.contains(engine)) { "ENGINE_IN_USE" }
         FlutterHullJSON.objectCopy(arguments)
         openingStarted = diagnostics.now()
         openingTimings = emptyMap()
@@ -422,6 +468,7 @@ class FlutterHullCoordinator(
                     current.timings["engineReadyMs"] =
                         (diagnostics.now() - current.startedAt) / 1_000_000.0
                     diagnose("communicationReady")
+                    activateRouting(current)
                 }
             }
             control.onFirstFrame = {
@@ -438,6 +485,7 @@ class FlutterHullCoordinator(
                 if (debuggable && handler != null) handler() else close {}
             }
             control.onEngineDetached = { if (record === current) engineWillDestroy() }
+            environment?.let { control.setEnvironment(it) }
             control.setLifecycle(hostVisible, hostForeground)
             control.configure(
                 mapOf(
@@ -445,6 +493,8 @@ class FlutterHullCoordinator(
                     "route" to route,
                     "arguments" to current.arguments,
                     "canFinishContainer" to (onCloseRequested != null),
+                    "availableCapabilities" to availableCapabilities.sorted(),
+                    "baselineId" to baselineId,
                     "restoration" to restoration,
                 )
             )
@@ -454,6 +504,42 @@ class FlutterHullCoordinator(
             context.invalidate()
             throw error
         }
+    }
+
+    /** 乱序修订丢弃；用户域切换在控制插件内同步清空恢复缓存。 */
+    fun setEnvironment(next: FlutterHullHostEnvironment): Boolean {
+        checkMain()
+        if (next.revision <= (environment?.revision ?: -1)) return false
+        if (environment != null && environment?.userDomain != next.userDomain)
+            routing.deactivate("USER_DOMAIN_CHANGED")
+        environment = next
+        record?.control?.setEnvironment(next)
+        record?.takeIf { it.communicationReady && !it.closing }?.let(::activateRouting)
+        return true
+    }
+
+    /** 冷启动 URL 在通信就绪前有界排队，重复 URL 共用同一可取消操作。 */
+    fun openURL(url: String, timeoutMillis: Long = 30000,
+        completion: (Result<Map<String, Any?>?>) -> Unit): FlutterHullRoutingOperation {
+        checkMain()
+        check(record?.closing != true) { "CLOSED" }
+        require(url.isNotEmpty() && url.toByteArray(Charsets.UTF_8).size <= 4096) { "INVALID_URL" }
+        return routing.open("openURL", mapOf("url" to url), url, timeoutMillis, completion)
+    }
+    fun openTarget(kind: String, route: String, arguments: Map<String, Any?> = emptyMap(),
+        timeoutMillis: Long = 30000, completion: (Result<Map<String, Any?>?>) -> Unit): FlutterHullRoutingOperation {
+        checkMain()
+        check(record?.closing != true) { "CLOSED" }
+        require(kind in setOf("flutter", "native", "rn", "web") && route.isNotEmpty() &&
+            route.toByteArray(Charsets.UTF_8).size <= 512) { "INVALID_TARGET" }
+        return routing.open("openTarget", mapOf("kind" to kind, "route" to route,
+            "arguments" to FlutterHullJSON.objectCopy(arguments)), timeoutMillis = timeoutMillis, completion = completion)
+    }
+    private fun activateRouting(current: Record) {
+        routing.activate(send = { method, arguments, completion ->
+            if (record !== current || current.closing) completion(Result.failure(FlutterHullCleanupError("CLOSED")))
+            else current.control.sendRouting(method, arguments, completion)
+        }, cancel = { current.control.cancelRouting(it) })
     }
 
     fun setVisible(visible: Boolean) {
@@ -470,7 +556,9 @@ class FlutterHullCoordinator(
 
     fun requestBack(completion: (Boolean) -> Unit) {
         checkMain()
-        record?.control?.requestBack(completion) ?: completion(true)
+        val current = record
+        if (current?.embedded == true && (!current.ownsBack || !hostVisible)) completion(false)
+        else current?.control?.requestBack(completion) ?: completion(true)
     }
 
     fun resume() {
@@ -546,6 +634,7 @@ class FlutterHullCoordinator(
             val now = SystemClock.uptimeMillis()
             val duration = timeoutMillis.coerceAtLeast(0)
             val closeDeadline = if (duration > Long.MAX_VALUE - now) Long.MAX_VALUE else now + duration
+            routing.deactivate("CLOSED")
             current.closing = true
             // 开始关闭就解绑平台服务；真实清理挂起时也不得继续触达旧 Activity。
             current.platformPlugin?.destroy()
@@ -750,6 +839,8 @@ class FlutterHullCoordinator(
             get() = ownedEngine ?: borrowedEngine.get()
 
         val id = UUID.randomUUID().toString()
+        var embedded = false
+        var ownsBack = true
         var initialRoute = "/"
         var arguments = emptyMap<String, Any?>()
         var startedAt = 0L

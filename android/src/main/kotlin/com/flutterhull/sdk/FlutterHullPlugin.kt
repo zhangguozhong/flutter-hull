@@ -12,6 +12,12 @@ class FlutterHullPlugin() : FlutterPlugin {
     }
 
     private var channel: MethodChannel? = null
+    // 可用性来自真实通道和关闭状态，不另设可能与Engine断开失步的开关。
+    private val transportAvailable: Boolean get() = channel != null && !closing
+    private var routingSerial = 0L
+    private val routingWaiters = mutableMapOf<Long, (Result<Map<String, Any?>?>) -> Unit>()
+    private var prewarmDeadline: Long? = null
+    private var environment: FlutterHullHostEnvironment? = null
     private var configuration: Map<String, Any?>? = null
     private var runToken: String? = null
     private var closing = false
@@ -48,13 +54,21 @@ class FlutterHullPlugin() : FlutterPlugin {
         configuration = null
         channel?.setMethodCallHandler(null)
         channel = null
+        val routing = routingWaiters.values.toList()
+        routingWaiters.clear()
+        routing.forEach { waiting -> runCatching { waiting(Result.failure(FlutterHullCleanupError("DART_UNAVAILABLE"))) } }
         backRound++
         val waiters = backWaiters.toList()
         backWaiters.clear()
         waiters.forEach { it(true) }
     }
 
-    internal fun configure(value: Map<String, Any?>) {
+    internal fun markPrewarming(ttlMillis: Long) {
+        if (!closing && configuration == null)
+            prewarmDeadline = android.os.SystemClock.uptimeMillis() + ttlMillis
+    }
+    internal fun configure(input: Map<String, Any?>) {
+        val value = if (environment == null) input else input + mapOf("environment" to environment?.toMap())
         check(configuration == null && !closing)
         restorationRevision = 0
         restorationSnapshot = value["restoration"]?.let { FlutterHullRestoration.normalize(it) }
@@ -83,7 +97,11 @@ class FlutterHullPlugin() : FlutterPlugin {
                                 token.isNullOrEmpty() ||
                                     token.toByteArray(Charsets.UTF_8).size > 256 ->
                                     reply.error("INVALID_ARGUMENT", "缺少启动标记", null)
-                                configuration == null -> reply.error("NOT_READY", "原生绑定尚未完成", null)
+                                configuration == null -> {
+                                    val remaining = (prewarmDeadline ?: 0) - android.os.SystemClock.uptimeMillis()
+                                    if (remaining > 0) reply.success(mapOf("prewarming" to true, "remainingMs" to remaining))
+                                    else reply.error("NOT_READY", "原生绑定尚未完成", null)
+                                }
                                 runToken != null && runToken != token -> {
                                     reply.error("HOT_RESTART_REQUIRES_REOPEN", "请重新打开容器", null)
                                     onRestart?.invoke()
@@ -121,6 +139,9 @@ class FlutterHullPlugin() : FlutterPlugin {
                                     .getOrNull()
                                 if (snapshot == null)
                                     reply.error("INVALID_ARGUMENT", "无效的页面快照", null)
+                                else if (environment != null &&
+                                    (snapshot["userDomain"] as? String ?: "anonymous") != environment?.userDomain)
+                                    reply.success(false)
                                 else {
                                     restorationSnapshot = snapshot
                                     restorationRevision = currentRevision
@@ -168,6 +189,56 @@ class FlutterHullPlugin() : FlutterPlugin {
                     }
                 }
             }
+    }
+
+    internal fun sendRouting(method: String, arguments: Map<String, Any?>,
+        completion: (Result<Map<String, Any?>?>) -> Unit) {
+        if (closing || !transportAvailable) {
+            completion(Result.failure(FlutterHullCleanupError("CLOSED")))
+            return
+        }
+        val activeChannel = channel ?: run {
+            completion(Result.failure(FlutterHullCleanupError("DART_UNAVAILABLE")))
+            return
+        }
+        val request = ++routingSerial
+        routingWaiters[request] = completion
+        fun finish(result: Result<Map<String, Any?>?>) {
+            // prepare/detach先清空真实在途表；迟到回复不能重新结算或成功。
+            val waiting = routingWaiters.remove(request) ?: return
+            waiting(result)
+        }
+        activeChannel.invokeMethod(method, arguments, object : MethodChannel.Result {
+            override fun success(value: Any?) {
+                finish(runCatching { if (value == null) null else FlutterHullJSON.objectCopy(value) })
+            }
+            override fun error(code: String, message: String?, details: Any?) {
+                finish(Result.failure(FlutterHullCleanupError(code)))
+            }
+            override fun notImplemented() {
+                finish(Result.failure(FlutterHullCleanupError("NAVIGATION_UNAVAILABLE")))
+            }
+        })
+    }
+
+    internal fun cancelRouting(requestId: String) {
+        if (!closing && transportAvailable) channel?.invokeMethod("cancelRouting", mapOf("requestId" to requestId))
+    }
+
+    internal fun setEnvironment(next: FlutterHullHostEnvironment): Boolean {
+        if (closing || !transportAvailable || next.revision <= (environment?.revision ?: -1)) return false
+        val changedDomain = environment != null && environment?.userDomain != next.userDomain
+        environment = next
+        if (changedDomain) restorationSnapshot = null
+        configuration?.let { current ->
+            val updated = current.toMutableMap()
+            updated["environment"] = next.toMap()
+            if (changedDomain) updated.remove("restoration")
+            configuration = updated.toMap()
+            channel?.invokeMethod("hostEnvironment", mapOf("containerId" to current["containerId"],
+                "environment" to next.toMap()))
+        }
+        return true
     }
 
     internal fun setLifecycle(visible: Boolean? = null, foreground: Boolean? = null) {
@@ -301,8 +372,9 @@ class FlutterHullPlugin() : FlutterPlugin {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         val callback = onEngineDetached
         onEngineDetached = null
-        callback?.invoke()
+        // 先封闭已断开的传输，再通知可能同步重入导航的Coordinator。
         prepareForEngineDestruction()
+        callback?.invoke()
         closing = true
         configuration = null
         channel?.setMethodCallHandler(null)

@@ -21,13 +21,26 @@ internal object FlutterHullRestoration {
             }
             val arguments = route["arguments"] as? Map<*, *> ?: invalid()
             val state = route["state"] as? Map<*, *> ?: invalid()
-            mapOf(
-                "route" to name,
-                "arguments" to arguments,
-                "state" to state,
-            )
+            val result = mutableMapOf<String, Any?>("route" to name, "arguments" to arguments, "state" to state)
+            if (route.containsKey("module")) {
+                val module = route["module"] as? Map<*, *> ?: invalid()
+                fun text(key: String): String {
+                    val value = module[key] as? String ?: invalid()
+                    require(value.isNotEmpty() && value.toByteArray(Charsets.UTF_8).size <= 128) { "INVALID_RESTORATION" }
+                    return value
+                }
+                val copied = mutableMapOf<String, Any?>("id" to text("id"), "version" to text("version"))
+                if (module.containsKey("baseline")) copied["baseline"] = text("baseline")
+                result["module"] = copied
+            }
+            result.toMap()
         }
-        val snapshot = mapOf("version" to 1, "routes" to normalized)
+        val snapshot = mutableMapOf<String, Any?>("version" to 1, "routes" to normalized)
+        if (source.containsKey("userDomain")) {
+            val domain = source["userDomain"] as? String ?: invalid()
+            require(domain.isNotEmpty() && domain.toByteArray(Charsets.UTF_8).size <= 128) { "INVALID_RESTORATION" }
+            snapshot["userDomain"] = domain
+        }
         return FlutterHullJSON.objectCopy(snapshot)
     }
 
