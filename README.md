@@ -44,7 +44,13 @@ maven {
 }
 ```
 
-保留 `google()`、`mavenCentral()`；Native 坐标应解析为 `com.aeris.sdk:aeris:0.26.0-preview.2`。无需添加本地 `:aeris` 项目或修改全局仓库。
+保留 `google()`、`mavenCentral()`；Native 坐标应解析为 `com.aeris.sdk:aeris:0.26.0-preview.2`。宿主原生代码直接使用BridgeEngine等Aeris类型时，在app模块dependencies中显式加入：
+
+```kotlin
+implementation("com.aeris.sdk:aeris:0.26.0-preview.2")
+```
+
+无需添加本地 `:aeris` 项目或修改全局仓库。
 
 ## 流程一：标准 Flutter App，接入现有 Engine
 
